@@ -1,0 +1,304 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Data Engineering Pipeline (Bronze -> Silver -> Gold) with S3, Glue, Step Functions, EventBridge.
+  Supports dev, qa, prod environments.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: de-lake
+    Description: Project prefix for resource names
+
+  Env:
+    Type: String
+    AllowedValues: [dev, qa, prod]
+    Default: dev
+    Description: Environment name (dev|qa|prod)
+
+  AlertEmail:
+    Type: String
+    Description: Email for SNS alerts
+
+  GlueDPU:
+    Type: Number
+    Default: 2
+    Description: Number of DPUs for Glue Jobs
+
+  GlueTimeout:
+    Type: Number
+    Default: 30
+    Description: Glue Job timeout in minutes
+
+Resources:
+  ### ----------------- S3 BUCKETS ----------------- ###
+  BronzeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Env}-bronze"
+      VersioningConfiguration:
+        Status: Enabled
+
+  SilverBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Env}-silver"
+      VersioningConfiguration:
+        Status: Enabled
+
+  GoldBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Env}-gold"
+      VersioningConfiguration:
+        Status: Enabled
+
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Env}-logs"
+      VersioningConfiguration:
+        Status: Enabled
+
+  ### ----------------- GLUE DATA CATALOG ----------------- ###
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${ProjectName}_${Env}_db"
+
+  ### ----------------- IAM ROLES ----------------- ###
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Env}-glue-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+
+  StepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Env}-sf-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSStepFunctionsFullAccess
+      Policies:
+        - PolicyName: AllowGlueAndSns
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                Resource: "*"
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref SNSTopic
+
+  EventsInvokeStepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Env}-events-to-sfn-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowStartExecution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref PipelineStateMachine
+
+  ### ----------------- GLUE JOBS ----------------- ###
+  BronzeToSilverJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-${Env}-bronze-to-silver"
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${ProjectName}-${Env}-logs/scripts/bronze_to_silver.py"
+        PythonVersion: "3"
+      DefaultArguments:
+        "--job-bookmark-option": "job-bookmark-enable"
+        "--TempDir": !Sub "s3://${LogsBucket}/temp/"
+      MaxRetries: 1
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      MaxCapacity: !Ref GlueDPU
+      Timeout: !Ref GlueTimeout
+
+  SilverToGoldJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-${Env}-silver-to-gold"
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${ProjectName}-${Env}-logs/scripts/silver_to_gold.py"
+        PythonVersion: "3"
+      DefaultArguments:
+        "--job-bookmark-option": "job-bookmark-enable"
+        "--TempDir": !Sub "s3://${LogsBucket}/temp/"
+      MaxRetries: 1
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      MaxCapacity: !Ref GlueDPU
+      Timeout: !Ref GlueTimeout
+
+  ### ----------------- CLOUDWATCH LOGS ----------------- ###
+  StepFunctionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/states/${ProjectName}-${Env}-pipeline"
+      RetentionInDays: 90
+
+  ### ----------------- STEP FUNCTIONS ----------------- ###
+  PipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${ProjectName}-${Env}-pipeline"
+      RoleArn: !GetAtt StepFunctionRole.Arn
+      LoggingConfiguration:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+        IncludeExecutionData: true
+        Level: ALL
+      DefinitionString: !Sub |
+        {
+          "Comment": "Bronze -> Silver -> Gold pipeline",
+          "StartAt": "BronzeToSilver",
+          "States": {
+            "BronzeToSilver": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${ProjectName}-${Env}-bronze-to-silver"
+              },
+              "Next": "SilverToGold",
+              "Retry": [{
+                "ErrorEquals": ["States.ALL"],
+                "IntervalSeconds": 60,
+                "MaxAttempts": 2,
+                "BackoffRate": 2.0
+              }],
+              "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.error",
+                "Next": "NotifyFailure"
+              }]
+            },
+            "SilverToGold": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${ProjectName}-${Env}-silver-to-gold"
+              },
+              "End": true,
+              "Retry": [{
+                "ErrorEquals": ["States.ALL"],
+                "IntervalSeconds": 60,
+                "MaxAttempts": 2,
+                "BackoffRate": 2.0
+              }],
+              "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.error",
+                "Next": "NotifyFailure"
+              }]
+            },
+            "NotifyFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+              "Parameters": {
+                "TopicArn": "${SNSTopic}",
+                "Subject": "DE Pipeline FAILED - ${ProjectName}-${Env}",
+                "Message.$": "$"
+              },
+              "Next": "FailState"
+            },
+            "FailState": {
+              "Type": "Fail",
+              "Cause": "PipelineFailed"
+            }
+          }
+        }
+
+  ### ----------------- SNS ALERTING ----------------- ###
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-${Env}-alerts"
+
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+      TopicArn: !Ref SNSTopic
+
+  ### ----------------- EVENTBRIDGE (S3 OBJECT CREATED) ----------------- ###
+  PipelineTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-${Env}-s3-trigger"
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Sub "${ProjectName}-${Env}-bronze"
+          # Optional filters to narrow triggers:
+          # object:
+          #   key:
+          #     - prefix: ingest/
+          #     - suffix: .csv
+      Targets:
+        - Arn: !Ref PipelineStateMachine
+          Id: "PipelineTarget"
+          RoleArn: !GetAtt EventsInvokeStepFunctionRole.Arn
+
+Outputs:
+  BronzeBucketName:
+    Value: !Ref BronzeBucket
+  SilverBucketName:
+    Value: !Ref SilverBucket
+  GoldBucketName:
+    Value: !Ref GoldBucket
+  LogsBucketName:
+    Value: !Ref LogsBucket
+  GlueDatabaseName:
+    Value: !Sub "${ProjectName}_${Env}_db"
+  StateMachineArn:
+    Value: !Ref PipelineStateMachine
+  AlertTopicArn:
+    Value: !Ref SNSTopic
+  StepFunctionsLogGroupName:
+    Value: !Ref StepFunctionsLogGroup
