@@ -145,6 +145,8 @@ Resources:
       DefaultArguments:
         "--job-bookmark-option": "job-bookmark-enable"
         "--TempDir": !Sub "s3://${LogsBucket}/temp/"
+        "--bronze_path": !Sub "s3://${ProjectName}-${Env}-bronze"
+        "--silver_path": !Sub "s3://${ProjectName}-${Env}-silver"
       MaxRetries: 1
       ExecutionProperty:
         MaxConcurrentRuns: 1
@@ -163,6 +165,8 @@ Resources:
       DefaultArguments:
         "--job-bookmark-option": "job-bookmark-enable"
         "--TempDir": !Sub "s3://${LogsBucket}/temp/"
+        "--silver_path": !Sub "s3://${ProjectName}-${Env}-silver"
+        "--gold_path":   !Sub "s3://${ProjectName}-${Env}-gold"
       MaxRetries: 1
       ExecutionProperty:
         MaxConcurrentRuns: 1
